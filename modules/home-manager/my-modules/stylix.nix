@@ -4,11 +4,14 @@ let
   cfg = config.components.my-modules.stylix;
 in
 {
+  imports = [ inputs.stylix.homeModules.stylix ];
+
   options.components.my-modules.stylix = {
     enable = mkEnableOption "My stylix config";
   };
 
   config = mkIf cfg.enable {
+    stylix.enable = true;
     # stylix.image = pkgs.fetchurl {
     #   url = "https://github.com/linkfrg/wallpapers/blob/main/nature/purple.jpg?raw=true";
     #   sha256 = "sha256-7RLhcvvUttaGnvxOjP5RKs3OPAOJXZPuNNeElY3szrg=";
