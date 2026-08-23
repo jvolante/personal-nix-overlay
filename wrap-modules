@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+#
+# wrap-modules — rewrite raw home-manager module files into "enable-wrapped"
+# modules. Given a raw module like
+#
+#     { pkgs, ... }: { programs.gitui = { ... }; }
+#
+# it produces an equivalent module exposing
+#
+#     options.components.my-modules.<name>.enable = mkEnableOption "...";
+#
+# and guarding the original body with `mkIf cfg.enable`.
+#
+# The transformation is driven by tree-sitter (AST extraction of the function
+# formals and body), and each result is verified by evaluating both the raw and
+# the wrapped module with stub arguments and asserting they produce identical
+# config (plus an empty config when the new enable is false). This catches, for
+# example, any unintended change to indented ''-string contents.
+#
+# The script needs a python3 with the `tree-sitter`/`tree-sitter-nix` packages.
+# If none is available it provisions one via `nix` into
+# ~/.cache/nix-wrap-modules/venv. Set WRAP_PYTHON to force an interpreter.
+set -euo pipefail
+
+WRAP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export WRAP_ROOT
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/nix-wrap-modules"
+PY_BIN="${WRAP_PYTHON:-}"
+
+if [[ -z "$PY_BIN" ]]; then
+  PY_BIN="$CACHE_DIR/venv/bin/python"
+  if ! "$PY_BIN" -c 'import tree_sitter, tree_sitter_nix' 2>/dev/null; then
+    echo "Provisioning python env with tree-sitter via nix..." >&2
+    mkdir -p "$CACHE_DIR"
+    nix shell nixpkgs#python3 --command bash -c '
+      python3 -m venv "$1"
+      "$1/bin/pip" install -q tree-sitter tree-sitter-nix
+    ' _ "$CACHE_DIR/venv"
+    "$PY_BIN" -c 'import tree_sitter, tree_sitter_nix' || {
+      echo "failed to provision python env; install tree-sitter + tree-sitter-nix and set WRAP_PYTHON" >&2
+      exit 1
+    }
+  fi
+fi
+
+exec "$PY_BIN" - "$@" <<'PYEOF'
+import json, shutil, subprocess
+from pathlib import Path
+import tree_sitter_nix as tsn
+from tree_sitter import Language, Parser
+
+parser = Parser(Language(tsn.language()))
+
+
+def named(node):
+    return [c for c in node.children if c.is_named]
+
+
+def find_all(node, ttype, acc=None):
+    if acc is None:
+        acc = []
+    if node.type == ttype:
+        acc.append(node)
+    for c in node.children:
+        if c.is_named:
+            find_all(c, ttype, acc)
+    return acc
+
+
+def text(src, node):
+    raw = src[node.start_byte:node.end_byte]
+    if isinstance(raw, bytes):
+        raw = raw.decode()
+    return raw
+
+
+def parse(src):
+    if isinstance(src, str):
+        src = src.encode()
+    return parser.parse(src)
+
+
+def indent_block(text, prefix="  "):
+    return "\n".join((prefix + ln) if ln else ln for ln in text.split("\n"))
+
+
+# ---------- stub pkgs for verification ----------
+
+
+def chain_of(node):
+    """Return (root_var, [attr, ...]) if node is a select chain rooted at a
+    variable, else None."""
+    parts = []
+    cur = node
+    while cur.type == "select_expression":
+        kids = named(cur)
+        if len(kids) < 2 or kids[1].type != "attrpath":
+            return None
+        parts = [c.text.decode() for c in kids[1].children if c.is_named] + parts
+        cur = kids[0]
+    if cur.type == "variable_expression":
+        return cur.text.decode(), parts
+    return None
+
+
+def collect_stub_usage(body_node):
+    """Scan body for `pkgs` usage. Return (chains, withs, override_chains)."""
+    chains = []
+    withs = []
+    override_chains = []
+
+    for sel in find_all(body_node, "select_expression", []):
+        ch = chain_of(sel)
+        if ch and ch[0] == "pkgs":
+            chains.append(ch[1])
+
+    for w in find_all(body_node, "with_expression", []):
+        kids = named(w)
+        if not kids:
+            continue
+        ch = chain_of(kids[0])
+        if not (ch and ch[0] == "pkgs"):
+            continue
+        body = kids[-1]
+        ids = [v.text.decode() for v in find_all(body, "variable_expression", [])
+               if v.text.decode() != "pkgs"]
+        withs.append((ch[1], ids))
+
+    for app in find_all(body_node, "apply_expression", []):
+        kids = named(app)
+        if kids and kids[0].type == "select_expression":
+            ch = chain_of(kids[0])
+            if ch and ch[0] == "pkgs" and len(ch[1]) > 0 and ch[1][-1] == "override":
+                override_chains.append(ch[1][:-1])
+
+    return chains, withs, override_chains
+
+
+def make_stub_expr(chains, withs, override_chains):
+    """Build a nix expression providing a lenient stand-in for pkgs, covering
+    exactly the attribute paths the body touches."""
+    tree = {}
+
+    def ensure(t, path):
+        cur = t
+        for k in path:
+            cur = cur.setdefault(k, {})
+        return cur
+
+    def prep(ch):
+        return ch[:-1] if ch and ch[-1] == "override" else ch
+
+    for ch in chains:
+        ensure(tree, prep(ch))
+    for ch, ids in withs:
+        node = ensure(tree, prep(ch))
+        for i in set(ids):
+            node.setdefault(i, {})
+    for ch in override_chains:
+        ensure(tree, ch)
+
+    override_paths = [tuple(ch) for ch in override_chains]
+
+    def render(node, path):
+        items = ['name = "stub";', 'outPath = "/stub";']
+        if path in override_paths:
+            items.append('override = _: { name = "stub"; outPath = "/stub"; };')
+        for k, v in node.items():
+            if isinstance(v, dict):
+                items.append(f"{k} = " + render(v, path + (k,)) + ";")
+            else:
+                items.append(f"{k} = {v};")
+        return "{ " + " ".join(items) + " }"
+
+    return render(tree, ())
+
+
+# ---------- wrap generation ----------
+
+
+def fmt_formals(names, multi):
+    if multi:
+        body = [f"  {n}," for n in names[:-1]] + [f"  {names[-1]}"]
+        return "{\n" + "\n".join(body) + "\n}"
+    return "{ " + ", ".join(names) + " }"
+
+
+def generate_wrapped(name, src, body_node, formal_names, has_ellipsis, multi):
+    body_text = text(src, body_node)
+    lines = body_text.split("\n")
+    if not (lines and lines[0].strip() == "{" and lines[-1].strip() == "}"):
+        raise ValueError("unexpected body shape")
+    inner = "\n".join(lines[1:-1])
+    new_names = ["lib", "config"] + [n for n in formal_names if n not in ("lib", "config")]
+    if has_ellipsis:
+        new_names.append("...")
+    elif "..." not in new_names:
+        new_names.append("...")
+    head = fmt_formals(new_names, multi)
+    out = [
+        head + ":",
+        "  with lib;",
+        "let",
+        f"  cfg = config.components.my-modules.{name};",
+        "in",
+        "{",
+        f"  options.components.my-modules.{name} = {{",
+        f'    enable = mkEnableOption "My {name} config";',
+        "  };",
+        "",
+        "  config = mkIf cfg.enable {",
+        indent_block(inner, "  "),
+        "  };",
+        "}",
+    ]
+    return "\n".join(out) + "\n"
+
+
+# ---------- verification ----------
+
+
+def harness_expr(raw_path, wrap_path, name, stub_expr, raw_formal_names):
+    lib_stub = ("{ mkIf = c: t: if c then t else {}; "
+                "mkEnableOption = d: { type = \"stub\"; description = d; }; }")
+    base_items = ["  lib = lib0;", f"  pkgs = {stub_expr};"]
+    for n in raw_formal_names:
+        if n not in ("pkgs", "lib"):
+            base_items.append(f"  {n} = {{}};")
+    base = "{\n" + "\n".join(base_items) + "\n}"
+    raw_import = f"import {json.dumps(str(raw_path))}"
+    wrap_import = f"import {json.dumps(str(wrap_path))}"
+    return f'''let
+  lib0 = {lib_stub};
+  base = {base};
+  wrapArgs = e: base // {{ config = {{ components.my-modules.{name}.enable = e; }}; }};
+  raw = {raw_import} base;
+  wrapped = {wrap_import};
+in
+{{
+  raw = raw;
+  wrapTrue = (wrapped (wrapArgs true)).config;
+  wrapFalse = (wrapped (wrapArgs false)).config;
+}}'''
+
+
+def run_nix(expr, cwd=None):
+    p = subprocess.run(
+        ["nix-instantiate", "--eval", "--strict", "--json", "--expr", expr],
+        capture_output=True, text=True, cwd=cwd, timeout=120)
+    if p.returncode != 0:
+        return None, p.stderr.strip()
+    return json.loads(p.stdout), None
+
+
+def formal_info(fe_node):
+    names = []
+    has_ellipsis = False
+    multi = False
+    form = None
+    for c in fe_node.children:
+        if c.type == "formals":
+            form = c
+            break
+    if form is None:
+        return [], False, False
+    multi = form.start_point.row != form.end_point.row
+    for c in form.children:
+        if not c.is_named:
+            continue
+        if c.type == "formal":
+            name_n = c.child_by_field_name("name")
+            if name_n is not None:
+                names.append(name_n.text.decode())
+            else:
+                for gc in c.children:
+                    if gc.type == "identifier":
+                        names.append(gc.text.decode())
+                        break
+        elif c.type == "ellipses":
+            has_ellipsis = True
+    return names, has_ellipsis, multi
+
+
+def check_file(raw_path, wrap_path, name, src):
+    tree = parse(src)
+    fe = find_all(tree.root_node, "function_expression", [])
+    if not fe:
+        return False, "not a function module"
+    body_node = fe[0].named_children[-1]
+    formal_names, has_ellipsis, _multi = formal_info(fe[0])
+    chains, withs, overrides = collect_stub_usage(body_node)
+    stub_expr = make_stub_expr(chains, withs, overrides)
+    expr = harness_expr(raw_path, wrap_path, name, stub_expr, formal_names)
+    data, err = run_nix(expr, cwd=str(raw_path.parent))
+    if data is None:
+        return False, "eval failed: " + err
+    if "raw" not in data or "wrapTrue" not in data or "wrapFalse" not in data:
+        return False, "eval missing keys: " + json.dumps(data)
+    if data["raw"] != data["wrapTrue"]:
+        return False, "raw != wrapped(config.enable=true)"
+    if data["wrapFalse"] != {}:
+        return False, "wrapped(config.enable=false) != {}"
+    return True, "verified"
+
+
+def main():
+    import argparse
+    import os
+    ap = argparse.ArgumentParser(
+        description="Wrap raw home-manager modules with an enable option "
+                    "scoped at components.my-modules.<name>")
+    ap.add_argument("files", nargs="*",
+                    help="files to transform (default: modules/home-manager/my-modules/*.nix)")
+    ap.add_argument("--dir",
+                    help="directory containing modules (default: <repo>/modules/home-manager/my-modules)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print generated modules instead of writing")
+    ap.add_argument("--no-check", action="store_true",
+                    help="skip nix eval verification")
+    ap.add_argument("--force", action="store_true",
+                    help="write even if verification fails")
+    args = ap.parse_args()
+
+    root = Path(os.environ.get("WRAP_ROOT", "."))
+    where = Path(args.dir) if args.dir else root / "modules/home-manager/my-modules"
+    files = [Path(f) for f in args.files] if args.files else sorted(where.glob("*.nix"))
+
+    has_nix = shutil.which("nix-instantiate") is not None
+    changed = 0
+    for fp in files:
+        if not fp.exists():
+            print(f"SKIP  {fp}: not found")
+            continue
+        src_bytes = fp.read_bytes()
+        src_text = src_bytes.decode("utf-8")
+        name = fp.stem
+        if "mkIf cfg.enable" in src_text or "options.components.my-modules." in src_text:
+            print(f"SKIP  {fp}: already wrapped")
+            continue
+        tree = parse(src_bytes)
+        if tree.root_node.has_error:
+            print(f"ERROR {fp}: failed to parse")
+            continue
+        fe = find_all(tree.root_node, "function_expression", [])
+        if not fe:
+            print(f"ERROR {fp}: not a function module")
+            continue
+        body_node = fe[0].named_children[-1]
+        formal_names, has_ellipsis, multi = formal_info(fe[0])
+        try:
+            new_text = generate_wrapped(name, src_bytes, body_node, formal_names, has_ellipsis, multi)
+        except ValueError as e:
+            print(f"ERROR {fp}: {e}")
+            continue
+
+        ok, msg = True, "ok"
+        if not args.no_check:
+            if not has_nix:
+                print(f"WARN  {fp}: nix-instantiate not found, skipping verification")
+            else:
+                tmp = fp.with_name(f".wrap-check-{name}.nix")
+                try:
+                    tmp.write_text(new_text)
+                    ok, msg = check_file(fp.resolve(), tmp.resolve(), name, src_bytes)
+                finally:
+                    if tmp.exists():
+                        tmp.unlink()
+        if args.dry_run:
+            print(f"===== {fp} ({msg}) =====")
+            print(new_text)
+            continue
+        if not ok and not args.force:
+            print(f"FAIL  {fp}: {msg} (use --force to write anyway)")
+            continue
+        fp.write_text(new_text)
+        print(f"OK    {fp}: {msg}")
+        changed += 1
+    print(f"\n{changed} module(s) transformed.")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
