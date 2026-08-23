@@ -13,7 +13,7 @@ in
     #   url = "https://github.com/linkfrg/wallpapers/blob/main/nature/purple.jpg?raw=true";
     #   sha256 = "sha256-7RLhcvvUttaGnvxOjP5RKs3OPAOJXZPuNNeElY3szrg=";
     # };
-    stylix.image = ../../resources/wallpaper.jpg;
+    stylix.image = ../../../assets/images/wallpaper.jpg;
 
     stylix.polarity = "dark";
     stylix.base16Scheme = "${pkgs.base16-schemes}/share/themes/rose-pine.yaml";
