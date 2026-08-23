@@ -34,11 +34,9 @@
           customPkgs = import ./pkgs { pkgs = final; };
         in
         customPkgs;
-
-      pkgSet = import ./pkgs { pkgs = nixpkgs.legacyPackages.x86_64-linux; };
     in
     {
-      lib = import ./lib { pkgs = nixpkgs; };
+      lib = import ./lib { lib = nixpkgs.lib; };
 
       packages = forAllSystems (
         sys:
@@ -50,20 +48,12 @@
 
       overlays = { default = pkgsOverlay; };
 
-      packagesOverlays = { default = pkgSet; };
-
-      nixosModules = {
-        default = { config, lib, ... }:
-          {
-            imports = lib.filesystem.listFilesRecursive ./modules/nixos;
-          };
+      nixosModules.default = { ... }: {
+        imports = nixpkgs.lib.filesystem.listFilesRecursive ./modules/nixos;
       };
 
-      homeModules = {
-        default = { config, lib, ... }:
-          {
-            imports = lib.filesystem.listFilesRecursive ./modules/home-manager;
-          };
+      homeModules.default = { ... }: {
+        imports = nixpkgs.lib.filesystem.listFilesRecursive ./modules/home-manager;
       };
 
       formatter = forAllSystems (

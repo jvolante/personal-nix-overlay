@@ -1,11 +1,7 @@
 {
-  pkgs ? (import ../nixpkgs.nix),
+  lib,
 }:
-let
-  inherit (pkgs) lib;
-in
-lib
-// {
+{
   # Check if a path exists, return path if it does, otherwise throw.
   # This is useful for service definitions, where the service runs an executable
   # like ${pkgs.nginx}/bin/nginx. You can wrap this like `lib.mustExist ${pkgs.nginx}/bin/nginx`

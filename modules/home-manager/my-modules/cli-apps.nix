@@ -16,10 +16,6 @@ in
   };
 
   config = mkIf cfg.enable {
-    imports = [
-      "${inputs.nvim-config}/home-manager/nvim.nix"
-    ];
-
     components.my-modules.boilerplate.enable = true;
 
     programs.my-modules.starship.enable = true;
